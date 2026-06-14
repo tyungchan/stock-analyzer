@@ -1,4 +1,4 @@
-import cors from "cors";
+import crypto from "crypto";
 import { config } from "dotenv";
 import express from "express";
 import { dirname, join } from "path";
@@ -11,6 +11,12 @@ const app = express();
 const port = process.env.PORT || 3001;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const distDir = join(__dirname, "../dist");
+const provider = String(process.env.ANALYSIS_PROVIDER || "anthropic").toLowerCase();
+const model = String(process.env.ANALYSIS_MODEL || "").trim();
+const accessToken = String(process.env.APP_ACCESS_TOKEN || "");
+const rateWindowMs = Number(process.env.RATE_WINDOW_MS || 60_000);
+const rateMax = Number(process.env.RATE_MAX || 3);
+const dailyMax = Number(process.env.DAILY_MAX || 50);
 
 const envKeys = {
   anthropic: "ANTHROPIC_API_KEY",
@@ -23,25 +29,34 @@ const envKeys = {
 };
 
 const rateLimit = new Map();
-const rateWindowMs = 60_000;
-const rateMax = 10;
+let dailyUsage = { date: new Date().toISOString().slice(0, 10), count: 0 };
 
-app.use(cors());
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 app.use(express.json({ limit: "20kb" }));
 app.use(express.static(distDir));
 
 app.get("/api/providers", (_req, res) => {
-  res.json(getProviders());
+  const configured = getProviders().find((item) => item.id === provider);
+  res.json(configured ? [{ ...configured, models: model ? [model] : configured.models }] : []);
 });
 
 app.post("/api/analyze", async (req, res) => {
   const ticker = String(req.body?.ticker || "").trim().toUpperCase();
-  const provider = String(req.body?.provider || "anthropic").trim().toLowerCase();
-  const model = String(req.body?.model || "").trim();
-  const suppliedKey = String(req.body?.apiKey || "").trim();
 
   if (!/^[A-Z0-9.-]{1,15}$/.test(ticker)) {
     return res.status(400).json({ error: "Enter a valid ticker symbol." });
+  }
+
+  if (!accessToken) {
+    return res.status(503).json({ error: "Server access is not configured." });
+  }
+
+  const suppliedToken = String(req.get("x-app-token") || "");
+  const expected = Buffer.from(accessToken);
+  const supplied = Buffer.from(suppliedToken);
+  if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
+    return res.status(401).json({ error: "Invalid access code." });
   }
 
   const now = Date.now();
@@ -56,15 +71,20 @@ app.post("/api/analyze", async (req, res) => {
     return res.status(429).json({ error: "Too many requests. Please wait a minute." });
   }
 
+  const today = new Date().toISOString().slice(0, 10);
+  if (dailyUsage.date !== today) dailyUsage = { date: today, count: 0 };
+  if (dailyUsage.count >= dailyMax) {
+    return res.status(429).json({ error: "The daily analysis limit has been reached." });
+  }
+
   const envName = envKeys[provider];
-  const apiKey = suppliedKey || (envName ? process.env[envName] : "");
+  const apiKey = envName ? process.env[envName] : "";
   if (!apiKey) {
-    return res.status(400).json({
-      error: `API key required for ${provider}. Enter one in Settings or configure ${envName || "the provider environment variable"}.`,
-    });
+    return res.status(503).json({ error: "The analysis provider is not configured." });
   }
 
   try {
+    dailyUsage.count += 1;
     const result = await analyze({ provider, apiKey, model, ticker });
     return res.json(result);
   } catch (error) {
